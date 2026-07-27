@@ -1,0 +1,110 @@
+name: build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3,9,15,21 * * *"
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "**/README.md"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  GEOIP_URL: https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/geoip.dat
+  GEOSITE_URL: https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/geosite.dat
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Set variables
+        run: |
+          echo "RELEASE_NAME=Released on $(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Checkout runetfreedom/geodat2srs
+        uses: actions/checkout@v4
+        with:
+          repository: runetfreedom/geodat2srs
+          path: geodat2srs
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ./geodat2srs/go.mod
+
+      - name: Collect dat files
+        run: |
+          mkdir -p ./publish
+          curl --fail --location --silent --show-error "$GEOIP_URL" > ./publish/geoip.dat
+          curl --fail --location --silent --show-error "${GEOIP_URL}.sha256sum" > ./publish/geoip.dat.sha256sum
+          curl --fail --location --silent --show-error "$GEOSITE_URL" > ./publish/geosite.dat
+          curl --fail --location --silent --show-error "${GEOSITE_URL}.sha256sum" > ./publish/geosite.dat.sha256sum
+
+      - name: Generate sing-box srs
+        run: |
+          go build -C geodat2srs ./
+          ./geodat2srs/geodat2srs geoip -i ./publish/geoip.dat -o ./publish/sing-box/rule-set-geoip/
+          ./geodat2srs/geodat2srs geosite -i ./publish/geosite.dat -o ./publish/sing-box/rule-set-geosite/
+          cd ./publish/sing-box || exit 1
+          zip -r ../sing-box.zip *
+
+      - name: Generate Pages index
+        run: |
+          touch ./publish/.nojekyll
+          python3 ./source/scripts/generate_index.py \
+            --root ./publish \
+            --output ./publish/index.html \
+            --json-output ./publish/files.json
+
+      - name: Release and upload assets
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          release_name: ${{ env.RELEASE_NAME }}
+          tag: ${{ env.TAG_NAME }}
+          file_glob: true
+          file: ./publish/*.*
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./publish
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Git push assets to release branch
+        run: |
+          cd publish || exit 1
+          git init
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b release
+          git add .
+          git commit -m "${{ env.RELEASE_NAME }}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -f -u origin release
